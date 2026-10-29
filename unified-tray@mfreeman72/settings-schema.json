@@ -1,0 +1,39 @@
+{
+    "left-click-action": {
+        "type": "combobox",
+        "default": "menu",
+        "description": "Left click on an icon",
+        "tooltip": "Show the menu: left and right click open a panel menu, with an 'Open <application>' entry added on top where it is useful. Activate directly: left click acts like a normal tray (it activates the icon) and menus contain only what the application itself provides. Middle click triggers the secondary action, Ctrl+right click opens the applet's own context menu.",
+        "options": {
+            "Show the menu (with an 'Open' entry on top)": "menu",
+            "Activate the item directly (like a normal tray)": "activate"
+        }
+    },
+    "right-click-native": {
+        "type": "switch",
+        "default": true,
+        "description": "Right click opens the application's own menu when it can't be translated",
+        "tooltip": "For XApp icons and StatusNotifier items without a dbusmenu, the menu exists only inside the application. Left click still shows the 'Open \u2026' menu."
+    },
+    "hidden-icons": {
+        "type": "entry",
+        "default": "",
+        "description": "Hidden icons (comma separated)",
+        "tooltip": "Icons whose application name, title, id or icon name contains any of these words are hidden."
+    },
+    "hide-open-for": {
+        "type": "entry",
+        "default": "",
+        "description": "Never show 'Open' for these icons (comma separated)",
+        "tooltip": "Icons whose application name, title, id or icon name contains any of these words get no 'Open' entry."
+    },
+    "reset-learned": {
+        "type": "button",
+        "description": "Forget what was learned about icons and clear stored menus",
+        "callback": "on_reset_learned"
+    },
+    "learned-no-open": {
+        "type": "generic",
+        "default": ""
+    }
+}

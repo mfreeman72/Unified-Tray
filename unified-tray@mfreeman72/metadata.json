@@ -1,0 +1,8 @@
+{
+    "uuid": "unified-tray@mfreeman72",
+    "name": "Unified Tray",
+    "description": "Replaces both the XApp Status and System Tray applets. Shows all status icons, but renders their (dbusmenu) menus as native Cinnamon panel menus, with an 'Open <App>' entry at the top for apps whose icon opens a window.",
+    "version": "0.2.0",
+    "max-instances": "1",
+    "icon": "preferences-system-network"
+}

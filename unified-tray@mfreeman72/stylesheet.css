@@ -1,0 +1,11 @@
+/* The container is invisible; each icon carries the theme's "applet-box" style. */
+.unified-tray,
+.unified-tray:hover,
+.unified-tray:focus,
+.unified-tray:active {
+    padding: 0px;
+    margin: 0px;
+    border: 0px;
+    background-color: transparent;
+    box-shadow: none;
+}
