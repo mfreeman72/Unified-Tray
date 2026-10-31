@@ -18,6 +18,7 @@
  */
 
 const Applet = imports.ui.applet;
+const DND = imports.ui.dnd;
 const Main = imports.ui.main;
 const Mainloop = imports.mainloop;
 const PopupMenu = imports.ui.popupMenu;
@@ -823,7 +824,7 @@ class TrayEntry {
         /* Same actor structure as the stock XAppStatusIcon */
         this.actor = new St.BoxLayout({
             style_class: "applet-box",
-            reactive: !global.settings.get_boolean("panel-edit-mode"),
+            reactive: true,
             track_hover: true,
             visible: false,
             // The systray uses a layout manager, we need to fill the space of the actor
@@ -844,7 +845,59 @@ class TrayEntry {
         this.actor.connect("scroll-event", (a, ev) => this.onScrollEvent(a, ev));
         this.actor.connect("enter-event", () => this.onEnterEvent());
 
+        /* Panel edit mode: Shift/Ctrl + drag reorders the icons (the drag is started by hand, see _onEditPress) */
+        this.actor._delegate = this;
+        this._draggable = null;
+        try {
+            let draggable;
+            try {
+                draggable = DND.makeDraggable(this.actor, { manualMode: true, restoreOnSuccess: false });
+            } catch (e) {
+                draggable = DND.makeDraggable(this.actor, { restoreOnSuccess: false });
+            }
+            draggable.inhibit = true;   // it never starts by itself, only through startDrag()
+            draggable.connect("drag-begin", () => this.applet.dragBegan(this));
+            draggable.connect("drag-end", () => this.applet.dragEnded(this));
+            this._draggable = draggable;
+        } catch (e) {
+            warn("drag and drop is unavailable, icons can't be reordered", e);
+        }
+
         this.setOrientation(applet.orientation);
+    }
+
+    /* Drag and drop: a small copy of the icon follows the pointer */
+    getDragActor() {
+        let icon = new St.Icon(this._iconParams || {
+            "icon-name": "application-x-executable",
+            "icon-size": this.applet.getPanelIconSize(St.IconType.FULLCOLOR)
+        });
+        icon.opacity = 220;
+        return icon;
+    }
+
+    getDragActorSource() {
+        return this.actor;
+    }
+
+    /* In panel edit mode only Shift/Ctrl + left button starts an icon drag; other presses move the applet itself */
+    _onEditPress(event) {
+        let mods = Clutter.ModifierType.SHIFT_MASK | Clutter.ModifierType.CONTROL_MASK;
+        if (this._draggable && event.get_button() === Clutter.BUTTON_PRIMARY && (event.get_state() & mods)) {
+            let [x, y] = event.get_coords();
+            try {
+                /* Cinnamon's startDrag() takes the event itself (other versions: its timestamp) */
+                try {
+                    this._draggable.startDrag(x, y, event);
+                } catch (e) {
+                    this._draggable.startDrag(x, y, event.get_time());
+                }
+            } catch (e) {
+                warn("could not start dragging " + this.displayName(), e);
+            }
+            return EVENT_STOP;
+        }
+        return EVENT_PROPAGATE;
     }
 
     /* ---- layout / icon (ported from xapp-status@cinnamon.org) ---- */
@@ -881,6 +934,7 @@ class TrayEntry {
             params.gicon = new Gio.FileIcon({ file: Gio.File.new_for_path(iconName) });
         else
             params["icon-name"] = iconName;
+        this._iconParams = params;
         this.icon_holder.show();
         this.icon_holder.child = new St.Icon(params);
     }
@@ -963,6 +1017,8 @@ class TrayEntry {
             this._tooltip.hide();
             this._tooltip.preventShow = true;
         }
+        if (global.settings.get_boolean("panel-edit-mode"))
+            return this._onEditPress(event);
 
         let button = event.get_button();
         if (button == Clutter.BUTTON_SECONDARY && (event.get_state() & Clutter.ModifierType.CONTROL_MASK))
@@ -985,6 +1041,8 @@ class TrayEntry {
     }
 
     onButtonReleaseEvent(actor, event) {
+        if (global.settings.get_boolean("panel-edit-mode"))
+            return EVENT_PROPAGATE;
         let button = event.get_button();
         if (button == Clutter.BUTTON_SECONDARY && (event.get_state() & Clutter.ModifierType.CONTROL_MASK))
             return EVENT_PROPAGATE;
@@ -1042,6 +1100,8 @@ class TrayEntry {
     }
 
     onScrollEvent(actor, event) {
+        if (global.settings.get_boolean("panel-edit-mode"))
+            return EVENT_PROPAGATE;
         let direction = event.get_scroll_direction();
         if (direction != Clutter.ScrollDirection.SMOOTH)
             this.scroll(direction, event);
@@ -1109,6 +1169,11 @@ class TrayEntry {
 
     /* Stable identifier used to remember things about this icon between sessions */
     stableId() { return ""; }
+
+    /* Identifies the icon in the saved icon order */
+    orderKey() {
+        return (this.kind + ":" + (this.stableId() || this.sortName())).toLowerCase();
+    }
 
     wmClasses() {
         let out = [];
@@ -1417,6 +1482,10 @@ class SniEntry extends TrayEntry {
         this._applyTooltip();
         this.setOrientation(this.applet.orientation);
         this.actor.queue_relayout();
+        if (!this._sorted && Object.keys(this.props).length > 0) {
+            this._sorted = true;
+            this.applet.sortEntries();
+        }
         this.applet.dedupeSni(this);
     }
 
@@ -2104,6 +2173,8 @@ class EmbeddedEntry extends TrayEntry {
      * icon.handle_event(), which passes it on to that window (this is what the stock applet does).
      */
     _onTrayEvent(icon, event) {
+        if (global.settings.get_boolean("panel-edit-mode"))
+            return false;   // editing the panel: nothing goes to the application
         let etype = event.type();
 
         /* Ctrl+right click belongs to the applet's own context menu */
@@ -2218,6 +2289,10 @@ class UnifiedTrayApplet extends Applet.Applet {
             this.manager_container = new St.BoxLayout({ vertical: false, style: HORIZONTAL_STYLE });
         this.actor.add_actor(this.manager_container);
         this.manager_container.show();
+        this.manager_container._delegate = {
+            handleDragOver: (...args) => this.handleDragOver(...args),
+            acceptDrop: (...args) => this.acceptDrop(...args)
+        };
 
         this._stage("settings", () => this._bindSettings(metadata, instanceId));
         this._stage("menu", () => this._createMenu());
@@ -2262,7 +2337,7 @@ class UnifiedTrayApplet extends Applet.Applet {
         for (let [key, prop] of [
             ["left-click-action", "leftClickAction"], ["hidden-icons", "hiddenIcons"],
             ["right-click-native", "rightClickNative"], ["hide-open-for", "hideOpenFor"],
-            ["learned-no-open", "learnedNoOpen"]
+            ["learned-no-open", "learnedNoOpen"], ["icon-order", "iconOrder"]
         ])
             this.settings.bind(key, prop, cb);
     }
@@ -2275,6 +2350,7 @@ class UnifiedTrayApplet extends Applet.Applet {
     _onSettingsChanged() {
         for (let e of this.entries.values())
             e.updateVisibility();
+        this.sortEntries();
     }
 
     isUserHidden(entry) {
@@ -2303,8 +2379,10 @@ class UnifiedTrayApplet extends Applet.Applet {
         this.learnedNoOpen = this._list(this.learnedNoOpen).filter(x => x !== want).join(",");
     }
 
-    /* Settings button: forget everything learned about icons and clear the stored menus */
+    /* Settings button: forget everything learned about icons, the stored menus and the saved icon order */
     on_reset_learned() {
+        this.iconOrder = "";
+        this.sortEntries();
         this.learnedNoOpen = "";
         this.menuCache = {};
         try {
@@ -2494,9 +2572,7 @@ class UnifiedTrayApplet extends Applet.Applet {
     }
 
     on_panel_edit_mode_changed() {
-        let reactive = !global.settings.get_boolean("panel-edit-mode");
-        for (let entry of this.entries.values())
-            entry.actor.reactive = reactive;
+        this.menu.close(false);
     }
 
     on_orientation_changed(orientation) {
@@ -2517,11 +2593,20 @@ class UnifiedTrayApplet extends Applet.Applet {
         this._shutdown();
     }
 
-    /* Symbolic icons last, then by name - as the stock applet does */
+    /* Saved order first; the rest as the stock applet does it: symbolic icons last, then by name */
     sortEntries() {
+        let order = String(this.iconOrder || "").split("|").filter(k => k);
         let list = Array.from(this.entries.values());
         let isSym = (e) => String(e.iconName || "").includes("-symbolic");
         list.sort((a, b) => {
+            let ia = order.indexOf(a.orderKey());
+            let ib = order.indexOf(b.orderKey());
+            if (ia >= 0 && ib >= 0)
+                return ia - ib;
+            if (ia >= 0)
+                return -1;
+            if (ib >= 0)
+                return 1;
             let aSym = isSym(a);
             let bSym = isSym(b);
             if (aSym && !bSym)
@@ -2531,7 +2616,74 @@ class UnifiedTrayApplet extends Applet.Applet {
             return GLib.utf8_collate(a.sortName(), b.sortName());
         });
         list.forEach((entry, i) => this.manager_container.set_child_at_index(entry.actor, i));
+    }
 
+    /* ---- reordering by drag and drop (panel edit mode, Shift/Ctrl + drag) ---- */
+    dragBegan(entry) {
+        this.menu.close(false);
+        this._dragOrder = this.manager_container.get_children();
+        this._dropAccepted = false;
+        entry.actor.opacity = 110;
+    }
+
+    dragEnded(entry) {
+        entry.actor.opacity = 255;
+        if (!this._dropAccepted && this._dragOrder) {
+            /* Dropped somewhere else: back to the order before the drag */
+            this._dragOrder.forEach((a, i) => {
+                try {
+                    if (a.get_parent() === this.manager_container)
+                        this.manager_container.set_child_at_index(a, i);
+                } catch (e) { /* icon was removed meanwhile */ }
+            });
+        }
+        this._dragOrder = null;
+    }
+
+    /* While dragging over the icons, the dragged icon moves to where it would land */
+    handleDragOver(source, dragActor, x, y) {
+        if (!(source instanceof TrayEntry))
+            return DND.DragMotionResult.CONTINUE;
+        let vertical = this.manager_container.vertical;
+        let pos = vertical ? y : x;
+        let others = this.manager_container.get_children().filter(a => a !== source.actor);
+        let before = others.find(a => {
+            if (!a.visible)
+                return false;
+            let [ax, ay] = a.get_position();
+            let [aw, ah] = a.get_size();
+            return pos < (vertical ? ay + ah / 2 : ax + aw / 2);
+        });
+        others.splice(before ? others.indexOf(before) : others.length, 0, source.actor);
+        others.forEach((a, i) => this.manager_container.set_child_at_index(a, i));
+        return DND.DragMotionResult.MOVE_DROP;
+    }
+
+    acceptDrop(source) {
+        if (!(source instanceof TrayEntry))
+            return false;
+        this._saveOrder();
+        this._dropAccepted = true;
+        return true;
+    }
+
+    /* Remember the current order of the icons */
+    _saveOrder() {
+        let keys = this.manager_container.get_children()
+            .map(a => (a._delegate && a._delegate.orderKey) ? a._delegate.orderKey() : null).filter(k => k);
+        this.iconOrder = this._mergeOrder(keys).join("|");
+    }
+
+    /* The new order of the running icons, keeping the saved position of icons that are not running right now */
+    _mergeOrder(visible) {
+        let old = String(this.iconOrder || "").split("|").filter(k => k);
+        let result = visible.slice();
+        old.forEach((k, i) => {
+            if (result.indexOf(k) >= 0)
+                return;
+            result.splice((i > 0 ? result.indexOf(old[i - 1]) : -1) + 1, 0, k);
+        });
+        return result;
     }
 
     /* ---- menu ---- */

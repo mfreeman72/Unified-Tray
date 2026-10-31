@@ -29,10 +29,14 @@
     },
     "reset-learned": {
         "type": "button",
-        "description": "Forget what was learned about icons and clear stored menus",
+        "description": "Forget what was learned about icons, clear stored menus and reset the icon order",
         "callback": "on_reset_learned"
     },
     "learned-no-open": {
+        "type": "generic",
+        "default": ""
+    },
+    "icon-order": {
         "type": "generic",
         "default": ""
     }
