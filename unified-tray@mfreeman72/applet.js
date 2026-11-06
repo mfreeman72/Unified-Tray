@@ -3026,6 +3026,24 @@ class UnifiedTrayApplet extends Applet.Applet {
         let entry = this.menuEntry;
         if (!entry)
             return;
+        /*
+         * Rebuilding an open menu (the application changed it, e.g. after a switch was flipped)
+         * destroys the item that has the key focus. Cinnamon's menu manager closes a menu whose
+         * focus goes elsewhere, so park the focus on the menu itself and give it back afterwards.
+         */
+        let refocus = -1;
+        let scrollPos = 0;
+        if (this.menu.isOpen) {
+            try {
+                let focus = global.stage.key_focus;
+                if (focus && this._menuSection)
+                    refocus = this._menuSection._getMenuItems().findIndex(it => it.actor && it.actor.contains(focus));
+                if (this._menuScroll)
+                    scrollPos = this._menuScroll.get_vscroll_bar().get_adjustment().value;
+            } catch (e) { /* only cosmetic */ }
+            this.menu.actor.grab_key_focus();
+        }
+        this._menuSection = null;
         this.menu.removeAll();
         if (this._menuScroll) {
             this._menuScroll.destroy();
@@ -3064,6 +3082,23 @@ class UnifiedTrayApplet extends Applet.Applet {
             let item = new PopupMenu.PopupMenuItem(_("No actions available"));
             item.setSensitive(false);
             section.addMenuItem(item);
+        }
+        this._menuSection = section;
+
+        if (refocus >= 0 || scrollPos > 0) {
+            /* After the new items are laid out: same scroll position, same item highlighted */
+            Mainloop.idle_add(() => {
+                if (this._menuSection !== section || !this.menu.isOpen)
+                    return false;
+                try {
+                    if (scrollPos > 0)
+                        scroll.get_vscroll_bar().get_adjustment().value = scrollPos;
+                    let item = refocus >= 0 ? section._getMenuItems()[refocus] : null;
+                    if (item && item.actor && item.actor.reactive)
+                        item.actor.grab_key_focus();
+                } catch (e) { /* only cosmetic */ }
+                return false;
+            });
         }
     }
 
