@@ -1,4 +1,69 @@
 {
+    "layout": {
+        "type": "layout",
+        "pages": [
+            "general-page",
+            "visibility-page"
+        ],
+        "general-page": {
+            "type": "page",
+            "title": "General",
+            "sections": [
+                "clicks-section",
+                "open-section",
+                "maintenance-section"
+            ]
+        },
+        "visibility-page": {
+            "type": "page",
+            "title": "Hidden icons",
+            "sections": [
+                "hidden-section",
+                "autohide-section"
+            ]
+        },
+        "clicks-section": {
+            "type": "section",
+            "title": "Click behaviour",
+            "keys": [
+                "left-click-action",
+                "right-click-native"
+            ]
+        },
+        "open-section": {
+            "type": "section",
+            "title": "'Open' menu entry",
+            "keys": [
+                "hide-open-for"
+            ]
+        },
+        "maintenance-section": {
+            "type": "section",
+            "title": "Maintenance",
+            "keys": [
+                "reset-learned"
+            ]
+        },
+        "hidden-section": {
+            "type": "section",
+            "title": "Always hidden",
+            "keys": [
+                "hidden-icons"
+            ]
+        },
+        "autohide-section": {
+            "type": "section",
+            "title": "Hide unused icons",
+            "keys": [
+                "autohide-enabled",
+                "autohide-hours",
+                "autohide-visit-minutes",
+                "autohide-button-position",
+                "autohide-menu-items",
+                "autohide-show-all"
+            ]
+        }
+    },
     "left-click-action": {
         "type": "combobox",
         "default": "menu",
@@ -26,6 +91,57 @@
         "default": "",
         "description": "Never show 'Open' for these icons (comma separated)",
         "tooltip": "Icons whose application name, title, id or icon name contains any of these words get no 'Open' entry."
+    },
+    "autohide-enabled": {
+        "type": "switch",
+        "default": false,
+        "description": "Move icons that are not used to a hidden icons menu",
+        "tooltip": "Icons you haven't clicked for a while move to a menu behind an arrow button next to the tray icons. Using an icon from that menu shows it in the panel for a while (see below); its 'Move to the panel' button brings it back (it hides again once unused for the time set below). Ctrl+right click an icon (or right click the arrow button) for 'Hide now' and 'Pin to the panel', which keeps an icon in the panel for good."
+    },
+    "autohide-hours": {
+        "type": "spinbutton",
+        "default": 24,
+        "min": 1,
+        "max": 720,
+        "step": 1,
+        "units": "hours",
+        "description": "Hide icons that have not been used for",
+        "tooltip": "Only time the computer is in use counts: time asleep, or without keyboard or mouse activity for more than 5 minutes, is not counted.",
+        "dependency": "autohide-enabled"
+    },
+    "autohide-visit-minutes": {
+        "type": "spinbutton",
+        "default": 0,
+        "min": 0,
+        "max": 1440,
+        "step": 5,
+        "units": "minutes",
+        "description": "After using a hidden icon, keep it in the panel for (0 = only while in use)",
+        "tooltip": "Using an icon from the hidden icons menu shows it in the panel without bringing it back. With 0 it returns to the hidden icons as soon as its menu or popup closes; otherwise it stays in the panel for this many minutes (only minutes the computer is in use count). To bring an icon back, use the 'Move to the panel' button next to it in the hidden icons menu, or 'Keep in the panel' in its Tray icon submenu while it is shown.",
+        "dependency": "autohide-enabled"
+    },
+    "autohide-button-position": {
+        "type": "combobox",
+        "default": "end",
+        "description": "Position of the hidden icons button",
+        "options": {
+            "After the icons (right / bottom)": "end",
+            "Before the icons (left / top)": "start"
+        },
+        "dependency": "autohide-enabled"
+    },
+    "autohide-menu-items": {
+        "type": "switch",
+        "default": true,
+        "description": "Add a 'Tray icon' submenu (hide / pin to the panel) to icon menus",
+        "tooltip": "Added at the bottom of the menus this applet shows for the icons. Icons whose menu is drawn by the application itself don't get it; Ctrl+right click such an icon for the same options.",
+        "dependency": "autohide-enabled"
+    },
+    "autohide-show-all": {
+        "type": "button",
+        "description": "Bring all hidden icons back to the panel",
+        "callback": "on_autohide_show_all",
+        "dependency": "autohide-enabled"
     },
     "reset-learned": {
         "type": "button",

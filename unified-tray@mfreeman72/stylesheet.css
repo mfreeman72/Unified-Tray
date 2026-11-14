@@ -2,10 +2,20 @@
 .unified-tray,
 .unified-tray:hover,
 .unified-tray:focus,
-.unified-tray:active {
+.unified-tray:active,
+.unified-tray:checked {
     padding: 0px;
     margin: 0px;
     border: 0px;
     background-color: transparent;
     box-shadow: none;
+}
+
+/* Pin button in the hidden icons menu */
+.unified-tray-pin {
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+.unified-tray-pin:hover {
+    background-color: rgba(128, 128, 128, 0.25);
 }

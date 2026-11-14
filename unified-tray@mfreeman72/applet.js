@@ -32,6 +32,7 @@ const GdkPixbuf = imports.gi.GdkPixbuf;
 const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
 const Gtk = imports.gi.Gtk;
+const Meta = imports.gi.Meta;
 const St = imports.gi.St;
 const Gettext = imports.gettext;
 const ByteArray = imports.byteArray;
@@ -66,6 +67,11 @@ const PROPS_IFACE = "org.freedesktop.DBus.Properties";
 const HORIZONTAL_STYLE = "padding-left: 2px; padding-right: 2px; padding-top: 0; padding-bottom: 0";
 const VERTICAL_STYLE = "padding-left: 0; padding-right: 0; padding-top: 2px; padding-bottom: 2px";
 
+/* Hiding icons that are not used (see "hiding icons" in the applet) */
+const AUTOHIDE_TICK = 60;              // seconds between checks
+const AUTOHIDE_IDLE_LIMIT = 5 * 60;    // seconds without keyboard/mouse input after which time stops counting
+const AUTOHIDE_FORGET_DAYS = 180;      // what is known about icons not seen for this long is dropped
+
 /* ------------------------------------------------------------------------ */
 /* Generic helpers                                                          */
 /* ------------------------------------------------------------------------ */
@@ -73,6 +79,92 @@ const VERTICAL_STYLE = "padding-left: 0; padding-right: 0; padding-top: 2px; pad
 function warn(msg, e) {
     global.logWarning("[" + UUID + "] " + msg + (e ? ": " + e : ""));
 }
+
+/*
+ * While a menu is open its panel button stays highlighted, so it is clear which icon the menu belongs to.
+ * Many themes (Mint-Y among them) don't style ":checked" for applets, so the button also keeps the theme's
+ * hover look: hover tracking is paused (it would drop the highlight as soon as the pointer moves into the
+ * menu) and resumed, in sync with the pointer, when the menu closes.
+ */
+function _setHighlight(actor, on) {
+    if (on) {
+        if (actor._menuHighlight)
+            return;
+        actor._menuHighlight = { trackHover: actor.track_hover };
+        actor.track_hover = false;
+        actor.add_style_pseudo_class("hover");
+        actor.add_style_pseudo_class("checked");
+    } else {
+        let saved = actor._menuHighlight;
+        if (!saved)
+            return;
+        actor._menuHighlight = null;
+        actor.remove_style_pseudo_class("checked");
+        actor.remove_style_pseudo_class("hover");
+        actor.track_hover = saved.trackHover;
+        if (saved.trackHover)
+            actor.sync_hover();
+    }
+}
+
+function highlightSource(menu, open) {
+    try {
+        if (open) {
+            let actor = menu.sourceActor;
+            if (menu._highlighted && menu._highlighted !== actor)
+                _setHighlight(menu._highlighted, false);
+            if (actor) {
+                _setHighlight(actor, true);
+                menu._highlighted = actor;
+            }
+        } else if (menu._highlighted) {
+            _setHighlight(menu._highlighted, false);
+            menu._highlighted = null;
+        }
+    } catch (e) { /* the actor is gone */ }
+}
+
+/*
+ * Tooltip for buttons inside our menus: Cinnamon's plain Tooltip (the one meant for things that are not
+ * panel items; PanelItemTooltip deliberately stays hidden while a menu is open). The plain one is placed
+ * at the pointer and only kept on screen sideways, so show() moves it next to its button - on the side
+ * away from the panel, flipped if there is no room - and keeps it fully on screen.
+ */
+function MenuButtonTooltip(actor, text, orientation) {
+    this._init(actor, text, orientation);
+}
+
+MenuButtonTooltip.prototype = {
+    __proto__: Tooltips.Tooltip.prototype,
+
+    _init: function (actor, text, orientation) {
+        Tooltips.Tooltip.prototype._init.call(this, actor, text);
+        this._button = actor;
+        this.orientation = orientation;
+    },
+
+    show: function () {
+        Tooltips.Tooltip.prototype.show.call(this);
+        if (!this.visible)
+            return;
+        try {
+            let actor = this._button;
+            let monitor = Main.layoutManager.findMonitorForActor(actor) || Main.layoutManager.primaryMonitor;
+            let [x, y] = actor.get_transformed_position();
+            let [w, h] = actor.get_transformed_size();
+            let [, , tw, th] = this._tooltip.get_preferred_size();
+            let gap = Math.round(4 * global.ui_scale);
+            let above = this.orientation !== St.Side.TOP;
+            let top = above ? y - th - gap : y + h + gap;
+            if (above ? top < monitor.y : top + th > monitor.y + monitor.height)
+                top = above ? y + h + gap : y - th - gap;   // no room: other side
+            let left = x + (w - tw) / 2;
+            left = Math.max(monitor.x, Math.min(left, monitor.x + monitor.width - tw));
+            top = Math.max(monitor.y, Math.min(top, monitor.y + monitor.height - th));
+            this._tooltip.set_position(Math.round(left), Math.round(top));
+        } catch (e) { /* keep the position Tooltip chose */ }
+    }
+};
 
 function isVertical(orientation) {
     return orientation === St.Side.LEFT || orientation === St.Side.RIGHT;
@@ -133,13 +225,20 @@ const GENERIC_PROCS = /^(python[\d.]*|sh|bash|dash|env|java|node|nodejs|electron
 let _appInfos = null;
 let _appInfosAt = 0;
 
-/* First .desktop application for which match({id, last, exe, wm, name}) is true */
-function findApp(match) {
+/*
+ * The .desktop application that matches best: score({id, last, exe, wm, name, launcher}) returns 0 for no
+ * match, higher for a better one; on a tie the first one found wins.
+ * "launcher" is true for entries that start the program with a URI (e.g. Steam's game shortcuts,
+ * "steam steam://rungameid/..."): they share the program's executable but are not the program itself.
+ */
+function findApp(score) {
     let now = GLib.get_monotonic_time();
     if (!_appInfos || now - _appInfosAt > 30e6) {
         _appInfos = Gio.AppInfo.get_all();
         _appInfosAt = now;
     }
+    let best = null;
+    let bestScore = 0;
     for (let info of _appInfos) {
         let id = (info.get_id() || "").toLowerCase().replace(/\.desktop$/, "");
         let exe = "";
@@ -149,10 +248,24 @@ function findApp(match) {
             wm = String((typeof info.get_startup_wm_class === "function" && info.get_startup_wm_class()) || "").toLowerCase();
         } catch (e) { /* not a desktop application */ }
         let name = String(info.get_name() || "").toLowerCase();
-        if (match({ id: id, last: id.split(".").pop(), exe: exe, wm: wm, name: name }))
-            return { name: info.get_name(), gicon: info.get_icon(), id: id, wmClass: wm };
+        let launcher = false;
+        try {
+            launcher = /\w+:\/\//.test(String(info.get_commandline() || ""));
+        } catch (e) { /* ignore */ }
+        let s = score({ id: id, last: id.split(".").pop(), exe: exe, wm: wm, name: name, launcher: launcher });
+        if (s > bestScore) {
+            bestScore = s;
+            best = { name: info.get_name(), gicon: info.get_icon(), id: id, wmClass: wm };
+        }
     }
-    return null;
+    return best;
+}
+
+/* Matching the executable only counts for less, and less again for shortcuts that launch something through it */
+function exeScore(k, token) {
+    if (!k.exe || token !== k.exe)
+        return 0;
+    return k.launcher ? 1 : 2;
 }
 
 /* Map a process id to its .desktop application (name + icon), best effort. */
@@ -166,7 +279,7 @@ function resolveApp(pid) {
             tokens.push(t);
     }
     for (let t of tokens) {
-        let app = findApp(k => t === k.id || t === k.last || (k.exe && t === k.exe));
+        let app = findApp(k => (t === k.id || t === k.last) ? 4 : exeScore(k, t));
         if (app)
             return app;
     }
@@ -178,8 +291,13 @@ function resolveAppByHint(hints) {
     let hs = hints.map(h => prettyName(h).toLowerCase()).filter(h => h.length >= 3);
     if (hs.length === 0)
         return null;
-    return findApp(k => hs.some(h => h === k.id || h === k.last || (k.exe && h === k.exe) ||
-        (k.wm && h === k.wm) || h === k.name));
+    return findApp(k => Math.max(...hs.map(h => {
+        if (h === k.id || h === k.last)
+            return 4;
+        if ((k.wm && h === k.wm) || h === k.name)
+            return 3;
+        return exeScore(k, h);
+    })));
 }
 
 /* "android-messages-desktop" -> "Android-Messages-Desktop": capitalise every word, whatever separates it */
@@ -310,8 +428,8 @@ const MENU_ICON_SIZE = 16;
 /*
  * Every item is a single child (an St.BoxLayout) so that PopupBaseMenuItem's
  * column logic can't stretch the icon column to the width of other items'
- * labels. If reserveIcon is set, items without an icon get an empty
- * placeholder so that all labels in the menu line up.
+ * labels. Items without an icon get no placeholder: their label starts at the
+ * left edge, even when other items in the same menu have icons.
  */
 let _applet = null;   // the running applet instance (so menu items can close its menu)
 
@@ -333,10 +451,6 @@ function iconNameUsable(name) {
     } catch (e) {
         return true;
     }
-}
-
-function hasUsableIcon(props) {
-    return iconNameUsable(props["icon-name"]) || !!(props["icon-data"] && props["icon-data"].length > 0);
 }
 
 /*
@@ -382,7 +496,7 @@ function makeRadioIndicator(state) {
  * switches in Cinnamon's own applet menus; opts.keepMenu keeps the menu open
  * when it is flipped. Items with an indicator or a switch get setToggleState().
  */
-function makeMenuItem(text, iconActor, reserveIcon, indicator, opts) {
+function makeMenuItem(text, iconActor, indicator, opts) {
     let item = new PopupMenu.PopupBaseMenuItem();
     /* Choosing an entry closes the menu (connected first, so it also happens if a later handler fails) */
     item.connect("activate", (it, event, keepMenu) => {
@@ -405,8 +519,6 @@ function makeMenuItem(text, iconActor, reserveIcon, indicator, opts) {
     if (iconActor) {
         iconActor.y_align = Clutter.ActorAlign.CENTER;
         box.add_actor(iconActor);
-    } else if (reserveIcon) {
-        box.add_actor(new St.Bin({ width: MENU_ICON_SIZE, height: MENU_ICON_SIZE }));
     }
     item.label = new St.Label({ text: text, y_align: Clutter.ActorAlign.CENTER, x_expand: true });
     box.add_actor(item.label);
@@ -472,10 +584,10 @@ class MenuBuilder {
         return kids.filter(k => k[1].visible !== false && k[1].type !== "separator");
     }
 
-    populate(shell, reserveIcon) {
+    populate(shell) {
         this.toggleItems = {};
         if (this.layout)
-            this._buildChildren(shell, this.layout, !!reserveIcon);
+            this._buildChildren(shell, this.layout);
     }
 
     hasItems() {
@@ -489,10 +601,8 @@ class MenuBuilder {
         return first.some(k => looksLikeOpen(k[1].label, appName));
     }
 
-    _buildChildren(shell, node, reserveIcon) {
+    _buildChildren(shell, node) {
         let kids = node[2] || [];
-        let anyIcon = !!reserveIcon || kids.some(k => k[1].visible !== false && k[1].type !== "separator" &&
-            hasUsableIcon(k[1]));
         /* Only radio items have a mark in front of the label (checkmark items get a switch at the end) */
         let anyRadio = kids.some(k => k[1].visible !== false && k[1].type !== "separator" &&
             k[1]["toggle-type"] === "radio");
@@ -514,17 +624,17 @@ class MenuBuilder {
                 pendingSeparator = false;
             }
             any = true;
-            shell.addMenuItem(this._makeItem(id, props, sub, anyIcon, anyRadio));
+            shell.addMenuItem(this._makeItem(id, props, sub, anyRadio));
         }
     }
 
-    _makeItem(id, props, sub, reserveIcon, reserveToggle) {
+    _makeItem(id, props, sub, reserveToggle) {
         let label = cleanLabel(props.label);
         let enabled = props.enabled !== false;
 
         if (props["children-display"] === "submenu" || sub.length > 0) {
             let item = new PopupMenu.PopupSubMenuMenuItem(label);
-            this._buildChildren(item.menu, [id, props, sub], false);
+            this._buildChildren(item.menu, [id, props, sub]);
             item.setSensitive(enabled);
             item.menu.connect("open-state-changed", (menu, open) => this.onSubmenuState(id, item, open));
             return item;
@@ -568,7 +678,7 @@ class MenuBuilder {
         else if (toggleType === "radio")
             indicator = { radio: on };
 
-        let item = makeMenuItem(label, iconActor, reserveIcon, indicator, opts);
+        let item = makeMenuItem(label, iconActor, indicator, opts);
 
         item.setSensitive(enabled);
         item.connect("activate", () => {
@@ -1191,8 +1301,10 @@ class TrayEntry {
             return this._onEditPress(event);
 
         let button = event.get_button();
-        if (button == Clutter.BUTTON_SECONDARY && (event.get_state() & Clutter.ModifierType.CONTROL_MASK))
+        if (button == Clutter.BUTTON_SECONDARY && (event.get_state() & Clutter.ModifierType.CONTROL_MASK)) {
+            this.applet.noteContextEntry(this);
             return EVENT_PROPAGATE; // let the applet's own context menu open
+        }
 
         /* A click while a menu is open (or that has just closed one) only closes it */
         if (this.applet.consumeClickIfMenuOpen(event)) {
@@ -1200,6 +1312,7 @@ class TrayEntry {
             return EVENT_STOP;
         }
 
+        this.applet.noteActivity(this);
         this.lastEventTime = event.get_time();
         this._pressedButton = button;
         this._rawPressed = this.forwardsRaw(button);
@@ -1273,8 +1386,10 @@ class TrayEntry {
         if (global.settings.get_boolean("panel-edit-mode"))
             return EVENT_PROPAGATE;
         let direction = event.get_scroll_direction();
-        if (direction != Clutter.ScrollDirection.SMOOTH)
+        if (direction != Clutter.ScrollDirection.SMOOTH) {
+            this.applet.noteActivity(this);
             this.scroll(direction, event);
+        }
         return EVENT_STOP;
     }
 
@@ -1292,6 +1407,22 @@ class TrayEntry {
                 this.applet.toggleMenuFor(this);
         } else if (button === Clutter.BUTTON_MIDDLE) {
             this.secondaryActivate();
+        }
+    }
+
+    /*
+     * Repeat a click made on this icon in the hidden icons menu, once the icon is back in the panel
+     * (so menus and applications see the icon's real position).
+     */
+    replayClick(button) {
+        this.lastEventTime = global.get_current_time();
+        this._pressedButton = 0;
+        this._releaseWaiters = [];
+        if (this.forwardsRaw(button)) {
+            if (typeof this.synthClick === "function")
+                this.synthClick(button, this.lastEventTime);
+        } else {
+            this.handleClick(button, null);
         }
     }
 
@@ -1334,7 +1465,11 @@ class TrayEntry {
     }
 
     updateVisibility() {
-        this.actor.visible = !this.destroyed && this.computeVisible() && !this.applet.isUserHidden(this);
+        let shown = !this.destroyed && this.computeVisible() && !this.applet.isUserHidden(this);
+        /* Auto-hidden icons stay hidden in the panel; they are only shown inside the hidden icons menu */
+        this.autoHidden = shown && this.applet.isAutoHidden(this);
+        this.actor.visible = shown && (!this.autoHidden || !!this.inOverflow);
+        this.applet.updateOverflowButton();
     }
 
     /* Stable identifier used to remember things about this icon between sessions */
@@ -1803,7 +1938,7 @@ class SniEntry extends TrayEntry {
         if (hasItems) {
             if (wantOpen)
                 menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-            source.populate(menu, false);
+            source.populate(menu);
         } else if (isMenuOnly || !wantOpen) {
             /* No dbusmenu: ask the application to show its own context menu. */
             let item = makeMenuItem(_("Show application menu"), null);
@@ -2228,7 +2363,7 @@ class XAppEntry extends TrayEntry {
             let source = new GtkMenuSource(this.gtkItems, this);
             if (added)
                 menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-            source.populate(menu, false);
+            source.populate(menu);
         } else if (!this.canTranslateNative()) {
             /* Translation unavailable: let the application show its own menu. */
             menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -2389,11 +2524,17 @@ class EmbeddedEntry extends TrayEntry {
         /* Ctrl+right click belongs to the applet's own context menu */
         if ((etype === Clutter.EventType.BUTTON_PRESS || etype === Clutter.EventType.BUTTON_RELEASE) &&
             event.get_button() === Clutter.BUTTON_SECONDARY &&
-            (event.get_state() & Clutter.ModifierType.CONTROL_MASK))
+            (event.get_state() & Clutter.ModifierType.CONTROL_MASK)) {
+            if (etype === Clutter.EventType.BUTTON_PRESS)
+                this.applet.noteContextEntry(this);
             return false;
+        }
 
         if (etype === Clutter.EventType.BUTTON_PRESS) {
             this._lastPressAt = GLib.get_monotonic_time();
+            this.applet.noteActivity(this);
+        } else if (etype === Clutter.EventType.SCROLL) {
+            this.applet.noteActivity(this);
         } else if (etype === Clutter.EventType.ENTER) {
             this._hovered = true;
             this.actor.add_style_pseudo_class("hover");
@@ -2419,6 +2560,37 @@ class EmbeddedEntry extends TrayEntry {
     refresh() {
         this.resize();
         this.setOrientation(this.applet.orientation);
+    }
+
+    /*
+     * A click repeated from the hidden icons menu: build the button events the icon would have received
+     * and hand them to the icon like _onTrayEvent does. Best effort - if it fails, the icon is still back
+     * in the panel and the user simply clicks it again.
+     */
+    synthClick(button, time) {
+        let icon = this.trayIcon;
+        let t = time || global.get_current_time();
+        let send = (type) => {
+            try {
+                let [x, y] = icon.get_transformed_position();
+                let [w, h] = icon.get_transformed_size();
+                let ev = Clutter.Event.new(type);
+                ev.set_button(button);
+                ev.set_coords(x + w / 2, y + h / 2);
+                ev.set_time(t);
+                ev.set_stage(global.stage);
+                ev.set_source(icon);
+                icon.handle_event(type, ev);
+            } catch (e) {
+                warn("could not repeat the click on legacy tray icon " + this.role, e);
+            }
+        };
+        send(Clutter.EventType.BUTTON_PRESS);
+        Mainloop.timeout_add(60, () => {
+            if (!this.destroyed)
+                send(Clutter.EventType.BUTTON_RELEASE);
+            return false;
+        });
     }
 
     matchNames() { return [this.role]; }
@@ -2484,6 +2656,7 @@ class UnifiedTrayApplet extends Applet.Applet {
         this._menuClosedAt = 0;
         this._suppressedSni = new Set();
         this.loadMenuCache();
+        this._loadAutohide();
 
         this.setAllowedLayout(Applet.AllowedLayout.BOTH);
 
@@ -2502,9 +2675,14 @@ class UnifiedTrayApplet extends Applet.Applet {
             handleDragOver: (...args) => this.handleDragOver(...args),
             acceptDrop: (...args) => this.acceptDrop(...args)
         };
+        this._stage("overflow button", () => this._createOverflowButton());
 
         this._stage("settings", () => this._bindSettings(metadata, instanceId));
         this._stage("menu", () => this._createMenu());
+        this._stage("autohide", () => {
+            this._createKeepMenu();
+            this._syncAutohideTimer();
+        });
 
         this.signalManager = new SignalManager.SignalManager(null);
         this._stage("signals", () => {
@@ -2549,7 +2727,10 @@ class UnifiedTrayApplet extends Applet.Applet {
         for (let [key, prop] of [
             ["left-click-action", "leftClickAction"], ["hidden-icons", "hiddenIcons"],
             ["right-click-native", "rightClickNative"], ["hide-open-for", "hideOpenFor"],
-            ["learned-no-open", "learnedNoOpen"], ["icon-order", "iconOrder"]
+            ["learned-no-open", "learnedNoOpen"], ["icon-order", "iconOrder"],
+            ["autohide-enabled", "autohideEnabled"], ["autohide-hours", "autohideHours"],
+            ["autohide-button-position", "autohideButtonPosition"], ["autohide-menu-items", "autohideMenuItems"],
+            ["autohide-visit-minutes", "autohideVisitMinutes"]
         ])
             this.settings.bind(key, prop, cb);
     }
@@ -2560,6 +2741,9 @@ class UnifiedTrayApplet extends Applet.Applet {
     }
 
     _onSettingsChanged() {
+        this._syncAutohideTimer();
+        if (!this.autohideEnabled && this.overflowMenu)
+            this.overflowMenu.close(false);
         for (let e of this.entries.values())
             e.updateVisibility();
         this.sortEntries();
@@ -2766,6 +2950,7 @@ class UnifiedTrayApplet extends Applet.Applet {
     refreshIcons() {
         for (let entry of this.entries.values())
             entry.refresh();
+        this._updateOverflowIcon();
     }
 
     ui_scale_changed() {
@@ -2785,6 +2970,8 @@ class UnifiedTrayApplet extends Applet.Applet {
 
     on_panel_edit_mode_changed() {
         this.menu.close(false);
+        if (this.overflowMenu)
+            this.overflowMenu.close(false);
     }
 
     on_orientation_changed(orientation) {
@@ -2798,6 +2985,9 @@ class UnifiedTrayApplet extends Applet.Applet {
         }
         this.menu.close(false);
         this._newMenu();
+        this._destroyOverflowMenu();
+        if (this._overflowTooltip)
+            this._overflowTooltip.orientation = orientation;
         this.refreshIcons();
     }
 
@@ -2831,12 +3021,34 @@ class UnifiedTrayApplet extends Applet.Applet {
                 return -1;
             return GLib.utf8_collate(a.sortName(), b.sortName());
         });
-        list.forEach((entry, i) => this.manager_container.set_child_at_index(entry.actor, i));
+        /* Icons sitting in the hidden icons menu are skipped; the hidden icons button goes first or last */
+        let index = this._overflowAtStart() ? 1 : 0;
+        for (let entry of list) {
+            if (entry.actor.get_parent() === this.manager_container)
+                this.manager_container.set_child_at_index(entry.actor, index++);
+        }
+        this._placeOverflowButton();
+    }
+
+    _overflowAtStart() {
+        return this.autohideButtonPosition === "start" && !!this.overflowButton &&
+            this.overflowButton.get_parent() === this.manager_container;
+    }
+
+    /* The hidden icons button sits after the icons (bottom / right) unless the setting says before */
+    _placeOverflowButton() {
+        let button = this.overflowButton;
+        if (!button || button.get_parent() !== this.manager_container)
+            return;
+        let last = this.manager_container.get_n_children() - 1;
+        this.manager_container.set_child_at_index(button, this.autohideButtonPosition === "start" ? 0 : last);
     }
 
     /* ---- reordering by drag and drop (panel edit mode, Shift/Ctrl + drag) ---- */
     dragBegan(entry) {
         this.menu.close(false);
+        if (this.overflowMenu)
+            this.overflowMenu.close(false);
         this._dragOrder = this.manager_container.get_children();
         this._dropAccepted = false;
         entry.actor.opacity = 110;
@@ -2862,7 +3074,7 @@ class UnifiedTrayApplet extends Applet.Applet {
             return DND.DragMotionResult.CONTINUE;
         let vertical = this.manager_container.vertical;
         let pos = vertical ? y : x;
-        let others = this.manager_container.get_children().filter(a => a !== source.actor);
+        let others = this.manager_container.get_children().filter(a => a !== source.actor && a !== this.overflowButton);
         let before = others.find(a => {
             if (!a.visible)
                 return false;
@@ -2871,7 +3083,9 @@ class UnifiedTrayApplet extends Applet.Applet {
             return pos < (vertical ? ay + ah / 2 : ax + aw / 2);
         });
         others.splice(before ? others.indexOf(before) : others.length, 0, source.actor);
-        others.forEach((a, i) => this.manager_container.set_child_at_index(a, i));
+        let offset = this._overflowAtStart() ? 1 : 0;
+        others.forEach((a, i) => this.manager_container.set_child_at_index(a, i + offset));
+        this._placeOverflowButton();
         return DND.DragMotionResult.MOVE_DROP;
     }
 
@@ -2930,6 +3144,7 @@ class UnifiedTrayApplet extends Applet.Applet {
         this.menuManager.addMenu(menu);
         this._menuScroll = null;
         menu.connect("open-state-changed", (m, open) => {
+            highlightSource(m, open);
             if (m !== this.menu)
                 return;
             if (!open) {
@@ -2950,11 +3165,16 @@ class UnifiedTrayApplet extends Applet.Applet {
      */
     consumeClickIfMenuOpen(event) {
         let t = event.get_time();
-        let wasOpen = this.menu.isOpen || (!!this._menuClosedAt && Math.abs(t - this._menuClosedAt) < 50);
+        let recently = (at) => !!at && Math.abs(t - at) < 50;
+        let overflowOpen = !!this.overflowMenu && this.overflowMenu.isOpen;
+        let wasOpen = this.menu.isOpen || overflowOpen || recently(this._menuClosedAt) ||
+            recently(this._overflowClosedAt);
         if (!wasOpen)
             return false;
         if (this.menu.isOpen)
             this.menu.close(true);
+        if (overflowOpen)
+            this.overflowMenu.close(true);
         return true;
     }
 
@@ -3063,8 +3283,9 @@ class UnifiedTrayApplet extends Applet.Applet {
             y_align: St.Align.START,
             style_class: "vfade"
         });
-        scroll.set_policy(St.PolicyType.NEVER, St.PolicyType.AUTOMATIC);
-        scroll.style = "max-height: " + this._maxMenuHeight(entry) + "px;";
+        scroll.set_policy(St.PolicyType.NEVER, St.PolicyType.NEVER);   // see _updateMenuScrollbar()
+        this._menuMaxHeight = this._maxMenuHeight(entry);
+        scroll.style = "max-height: " + this._menuMaxHeight + "px;";
         scroll.add_actor(section.actor);
         if (typeof this.menu.addActor === "function")
             this.menu.addActor(scroll);
@@ -3083,6 +3304,8 @@ class UnifiedTrayApplet extends Applet.Applet {
             item.setSensitive(false);
             section.addMenuItem(item);
         }
+        this._addAutohideItems(section, entry);
+        this._watchSubmenus(section, scroll);
         this._menuSection = section;
 
         if (refocus >= 0 || scrollPos > 0) {
@@ -3100,6 +3323,45 @@ class UnifiedTrayApplet extends Applet.Applet {
                 return false;
             });
         }
+    }
+
+    /* Opening or closing a submenu changes the menu's height: it may need its scrollbar then, or no more */
+    _watchSubmenus(section, scroll) {
+        let walk = (menu) => {
+            let items = [];
+            try {
+                items = menu._getMenuItems();
+            } catch (e) { /* not a menu */ }
+            for (let item of items) {
+                if (item && item.menu instanceof PopupMenu.PopupSubMenu) {
+                    item.menu.connect("open-state-changed", () => {
+                        Mainloop.idle_add(() => {
+                            if (this._menuScroll === scroll)
+                                this._updateMenuScrollbar(scroll, section);
+                            return false;
+                        });
+                    });
+                    walk(item.menu);
+                }
+            }
+        };
+        walk(section);
+        this._updateMenuScrollbar(scroll, section);
+    }
+
+    /*
+     * The scroll view keeps room for an automatic scrollbar even while it is hidden, which left an empty
+     * strip on the right of every menu: the scrollbar is only turned on when the items don't fit (as
+     * Cinnamon does for its submenus).
+     */
+    _updateMenuScrollbar(scroll, section) {
+        try {
+            let [, natural] = section.actor.get_preferred_height(-1);
+            let max = (this._menuMaxHeight || 600) * global.ui_scale;
+            let policy = natural > max ? St.PolicyType.AUTOMATIC : St.PolicyType.NEVER;
+            if (scroll.vscrollbar_policy !== policy)
+                scroll.set_policy(St.PolicyType.NEVER, policy);
+        } catch (e) { /* keep the current policy */ }
     }
 
     /* Open the (already prepared) menu of an entry right away */
@@ -3191,6 +3453,798 @@ class UnifiedTrayApplet extends Applet.Applet {
         };
     }
 
+    /* ---- hiding icons that have not been used for a while ---- */
+    /*
+     * this.autohide.clock counts the seconds the session has been in use: time asleep, or with nobody at
+     * the keyboard, doesn't count, so a weekend away doesn't hide everything. Each icon remembers the clock
+     * value of its last use ("used"); an icon not used for the configured time is shown only in the hidden
+     * icons menu (the arrow button in front of the icons). Icons are identified by orderKey(), the same key
+     * the saved icon order uses. "pin" keeps an icon in the panel for good.
+     */
+    _autohidePath() {
+        return GLib.build_filenamev([GLib.get_user_config_dir(), "unified-tray", "autohide.json"]);
+    }
+
+    _today() {
+        return Math.floor(GLib.get_real_time() / 86400e6);
+    }
+
+    _loadAutohide() {
+        this.autohide = { clock: 0, icons: {} };
+        this._autohideDirty = false;
+        try {
+            let [ok, data] = GLib.file_get_contents(this._autohidePath());
+            if (!ok)
+                return;
+            let obj = JSON.parse(bytesToString(data));
+            if (!obj || typeof obj.clock !== "number" || !obj.icons || typeof obj.icons !== "object")
+                return;
+            let today = this._today();
+            for (let [key, rec] of Object.entries(obj.icons)) {
+                if (!rec || typeof rec.used !== "number")
+                    continue;
+                if (!rec.pin && typeof rec.day === "number" && today - rec.day > AUTOHIDE_FORGET_DAYS) {
+                    this._autohideDirty = true;   // not seen for months: forget it
+                    continue;
+                }
+                this.autohide.icons[key] = rec;
+            }
+            this.autohide.clock = obj.clock;
+        } catch (e) { /* nothing stored yet */ }
+    }
+
+    _saveAutohide() {
+        if (!this._autohideDirty || !this.autohide)
+            return;
+        try {
+            GLib.mkdir_with_parents(GLib.path_get_dirname(this._autohidePath()), 0o755);
+            GLib.file_set_contents(this._autohidePath(), JSON.stringify(this.autohide));
+            this._autohideDirty = false;
+        } catch (e) {
+            warn("could not store which icons are in use", e);
+        }
+    }
+
+    _autohideLimit() {
+        let hours = Number(this.autohideHours);
+        return (hours > 0 ? hours : 24) * 3600;
+    }
+
+    /* What is known about an entry; an icon seen for the first time counts as just used */
+    _autohideRecord(entry) {
+        let key = entry.orderKey();
+        let rec = this.autohide.icons[key];
+        if (!rec) {
+            rec = { used: this.autohide.clock };
+            this.autohide.icons[key] = rec;
+            this._autohideDirty = true;
+        }
+        let today = this._today();
+        if (rec.day !== today) {
+            rec.day = today;
+            this._autohideDirty = true;
+        }
+        return rec;
+    }
+
+    /* The pointer is on the icon or its menu is open: it must not be pulled away now */
+    _entryBusy(entry) {
+        if (this.menuEntry === entry && this.menu && this.menu.isOpen)
+            return true;
+        try {
+            return !!entry.actor.hover;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /*
+     * The pointer is anywhere on the tray, or one of its menus is open: icons are not hidden by the timeout
+     * now, as the remaining ones would shift and the icon under the pointer move away. They are hidden at
+     * the next check once the pointer has left. (Hiding by hand happens right away.)
+     */
+    _trayBusy() {
+        if ((this.menu && this.menu.isOpen) || (this.overflowMenu && this.overflowMenu.isOpen))
+            return true;
+        try {
+            let [px, py] = global.get_pointer();
+            let [x, y] = this.actor.get_transformed_position();
+            let [w, h] = this.actor.get_transformed_size();
+            return px >= x && px < x + w && py >= y && py < y + h;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /* Called by updateVisibility() for icons that are shown */
+    isAutoHidden(entry) {
+        if (!this.autohideEnabled || !this.autohide || entry.destroyed)
+            return false;
+        let rec = this._autohideRecord(entry);
+        if (rec.pin)
+            return false;
+        if (entry._tempVisit)
+            return false;   // shown for a click made in the hidden icons menu
+        if (rec.shownUntil) {
+            if (this.autohide.clock < rec.shownUntil)
+                return false;   // shown for a while after being used from the hidden icons menu
+            delete rec.shownUntil;
+            this._autohideDirty = true;
+        }
+        /* Hidden by hand (stays hidden until used), or not used for the configured time */
+        let due = !!rec.forced || this.autohide.clock - rec.used >= this._autohideLimit();
+        if (!due)
+            return false;
+        if (entry.autoHidden || entry._hidingNow)
+            return true;    // already hidden, or "Hide now" was chosen this very moment
+        /* Otherwise not while the pointer is on the tray or a menu is open (see _trayBusy) */
+        return !(this._entryBusy(entry) || this._trayBusy());
+    }
+
+    /*
+     * A "Tray icon" submenu ("Move to hidden icons" - or "Keep in the panel" for an icon only visiting the
+     * panel - and "Pin to the panel") at the bottom of an icon's own
+     * (translated) menu, below a separator, so these read as the tray's options, not the application's.
+     * Menus the applications draw themselves can't get it: Ctrl+right click offers the same there.
+     */
+    _addAutohideItems(section, entry) {
+        if (!this.autohideEnabled || !this.autohideMenuItems || entry.destroyed || !entry.computeVisible() ||
+            this.isUserHidden(entry))
+            return;
+        let pinned = !!this._autohideRecord(entry).pin;
+        section.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        let sub = new PopupMenu.PopupSubMenuMenuItem(_("Tray icon"));
+        /* Built like the application's own items (makeMenuItem), so icons, switches and padding line up */
+        let symbolic = (name) => new St.Icon({
+            icon_name: name,
+            icon_type: St.IconType.SYMBOLIC,
+            icon_size: MENU_ICON_SIZE
+        });
+        if (this.isVisiting(entry)) {
+            let back = makeMenuItem(_("Keep in the panel"), symbolic("view-reveal-symbolic"), null, null);
+            back.connect("activate", () => this.moveToPanel(entry));
+            sub.menu.addMenuItem(back);
+        } else if (!entry.autoHidden) {
+            let hide = makeMenuItem(_("Move to hidden icons"), symbolic("view-conceal-symbolic"), null, null);
+            hide.connect("activate", () => this.hideNow(entry));
+            sub.menu.addMenuItem(hide);
+        }
+        /* A switch: flipping it leaves the menu open, like the application's own switches */
+        let keep = makeMenuItem(_("Pin to the panel"), null, null, { switchState: pinned, keepMenu: true });
+        keep.connect("activate", () => this.setPinned(entry, keep._switch.state));
+        sub.menu.addMenuItem(keep);
+        section.addMenuItem(sub);
+    }
+
+    /* The user clicked or scrolled on an icon */
+    noteActivity(entry) {
+        if (!this.autohideEnabled || !this.autohide || entry.destroyed)
+            return;
+        if (this.isVisiting(entry)) {
+            /*
+             * Using an icon that is only visiting the panel doesn't bring it back; a visit for a set time
+             * starts its minutes over, so the icon only leaves once it hasn't been used for that long.
+             */
+            let rec = this.autohide.icons[entry.orderKey()];
+            let minutes = Number(this.autohideVisitMinutes);
+            if (!entry._tempVisit && rec && rec.shownUntil && minutes > 0) {
+                rec.shownUntil = Math.max(rec.shownUntil, this.autohide.clock + minutes * 60);
+                this._autohideDirty = true;
+            }
+            return;
+        }
+        let rec = this._autohideRecord(entry);
+        rec.used = this.autohide.clock;
+        delete rec.forced;
+        this._autohideDirty = true;
+        if (entry.autoHidden)
+            entry.updateVisibility();
+    }
+
+    /* True while a hidden icon is only visiting the panel (for a click, or for a while) */
+    isVisiting(entry) {
+        if (entry._tempVisit)
+            return true;
+        let rec = this.autohide ? this.autohide.icons[entry.orderKey()] : null;
+        return !!(rec && rec.shownUntil && this.autohide.clock < rec.shownUntil);
+    }
+
+    /* Used from the hidden icons menu with a time set: the icon stays in the panel for that many minutes of use */
+    _showForAWhile(entry) {
+        this._endTempVisit(entry, true);
+        let minutes = Number(this.autohideVisitMinutes);
+        let rec = this._autohideRecord(entry);
+        rec.shownUntil = this.autohide.clock + (minutes > 0 ? minutes : 30) * 60;
+        this._autohideDirty = true;
+        this._saveAutohide();
+        entry.updateVisibility();
+    }
+
+    _clearVisit(entry) {
+        this._endTempVisit(entry, true);
+        let rec = this.autohide ? this.autohide.icons[entry.orderKey()] : null;
+        if (rec && rec.shownUntil) {
+            delete rec.shownUntil;
+            this._autohideDirty = true;
+        }
+    }
+
+    /* Back to the panel for good (not pinned: the icon starts a fresh period, as if it was just used) */
+    moveToPanel(entry) {
+        this._clearVisit(entry);
+        this.noteActivity(entry);
+        entry.updateVisibility();
+    }
+
+    /*
+     * Used from the hidden icons menu with 0 minutes set: the icon appears in the panel for the click made in
+     * the hidden icons menu without counting as used. It goes back once nothing of it is in use any more:
+     * no menu of ours for it (being prepared or open), no popup window of its process (the application's
+     * own menu), the pointer not on it - checked twice a second, after a short grace period for menus
+     * and popups to appear.
+     */
+    _startTempVisit(entry) {
+        this._endTempVisit(entry, true);
+        let visit = { start: GLib.get_monotonic_time(), popups: new Set(), mapId: 0, timer: 0 };
+        entry._tempVisit = visit;
+        if (entry.pid) {
+            try {
+                visit.mapId = global.window_manager.connect("map", (wm, actor) => {
+                    try {
+                        let win = actor.meta_window;
+                        if (win && win.get_pid() === entry.pid && win.is_override_redirect()) {
+                            visit.popups.add(actor);
+                            actor.connect("destroy", () => visit.popups.delete(actor));
+                        }
+                    } catch (e) { /* ignore */ }
+                });
+            } catch (e) {
+                visit.mapId = 0;
+            }
+        }
+        visit.timer = Mainloop.timeout_add(500, () => {
+            if (entry._tempVisit === visit && !entry.destroyed && this._tempVisitBusy(entry, visit))
+                return true;
+            visit.timer = 0;
+            if (entry._tempVisit === visit)
+                this._endTempVisit(entry);
+            return false;
+        });
+        entry.updateVisibility();
+    }
+
+    _tempVisitBusy(entry, visit) {
+        if (GLib.get_monotonic_time() - visit.start < 1500e3)
+            return true;
+        if (this.menuEntry === entry)
+            return true;
+        if (visit.popups.size > 0)
+            return true;
+        /* Ends with the pointer off the tray; isAutoHidden() would keep it shown till then anyway */
+        return this._trayBusy();
+    }
+
+    _endTempVisit(entry, quiet) {
+        let visit = entry._tempVisit;
+        if (!visit)
+            return;
+        entry._tempVisit = null;
+        if (visit.mapId) {
+            global.window_manager.disconnect(visit.mapId);
+            visit.mapId = 0;
+        }
+        if (visit.timer) {
+            Mainloop.source_remove(visit.timer);
+            visit.timer = 0;
+        }
+        visit.popups.clear();
+        if (!quiet && !entry.destroyed)
+            entry.updateVisibility();
+    }
+
+    /* Move an icon to the hidden icons menu right away; it comes back like any hidden icon, when used */
+    hideNow(entry) {
+        if (entry.destroyed || !this.autohideEnabled)
+            return;
+        this._clearVisit(entry);
+        let rec = this._autohideRecord(entry);
+        delete rec.pin;
+        rec.forced = true;
+        this._autohideDirty = true;
+        this._saveAutohide();
+        entry._hidingNow = true;
+        try {
+            entry.updateVisibility();
+        } finally {
+            entry._hidingNow = false;
+        }
+    }
+
+    /* The icon a Ctrl+right click (which opens the context menu) was made on */
+    noteContextEntry(entry) {
+        this._contextEntry = { entry: entry, at: GLib.get_monotonic_time() };
+    }
+
+    /* Keep an icon in the panel for good, or let it be hidden again (it then starts a fresh period) */
+    setPinned(entry, pinned) {
+        if (entry.destroyed)
+            return;
+        this._clearVisit(entry);
+        let rec = this._autohideRecord(entry);
+        delete rec.forced;
+        if (pinned) {
+            rec.pin = true;
+        } else {
+            delete rec.pin;
+            rec.used = this.autohide.clock;
+        }
+        this._autohideDirty = true;
+        this._saveAutohide();
+        entry.updateVisibility();
+    }
+
+    /* Settings button */
+    on_autohide_show_all() {
+        for (let rec of Object.values(this.autohide.icons)) {
+            rec.used = this.autohide.clock;
+            delete rec.forced;
+            delete rec.shownUntil;
+        }
+        this._autohideDirty = true;
+        this._saveAutohide();
+        for (let entry of this.entries.values())
+            entry.updateVisibility();
+    }
+
+    _syncAutohideTimer() {
+        let want = !!this.autohideEnabled && !this._shuttingDown;
+        if (want && !this._autohideTimer) {
+            this._autohideLast = GLib.get_monotonic_time();
+            this._autohideTicks = 0;
+            this._autohideTimer = Mainloop.timeout_add_seconds(AUTOHIDE_TICK, () => {
+                try {
+                    this._autohideTick();
+                } catch (e) {
+                    warn("checking for unused icons failed", e);
+                }
+                return true;
+            });
+        } else if (!want && this._autohideTimer) {
+            Mainloop.source_remove(this._autohideTimer);
+            this._autohideTimer = 0;
+            this._saveAutohide();
+        }
+    }
+
+    /* Seconds since the last keyboard or mouse input (0 if this can't be found out: the time then counts) */
+    _userIdleSeconds() {
+        try {
+            return Meta.IdleMonitor.get_core().get_idletime() / 1000;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    _autohideTick() {
+        let now = GLib.get_monotonic_time();
+        /* The monotonic clock stands still while suspended; a late tick never counts for more than two */
+        let elapsed = Math.min(Math.max(0, (now - this._autohideLast) / 1e6), 2 * AUTOHIDE_TICK);
+        this._autohideLast = now;
+        if (this._userIdleSeconds() < AUTOHIDE_IDLE_LIMIT) {
+            this.autohide.clock += Math.round(elapsed);
+            this._autohideDirty = true;
+        }
+        for (let entry of this.entries.values())
+            entry.updateVisibility();
+        if (++this._autohideTicks % 10 === 0)
+            this._saveAutohide();
+    }
+
+    /* ---- the hidden icons button and its menu ---- */
+    _createOverflowButton() {
+        let button = new St.BoxLayout({
+            style_class: "applet-box",
+            reactive: true,
+            track_hover: true,
+            visible: false,
+            x_expand: true,
+            y_expand: true
+        });
+        this.overflowIcon = new St.Icon({ icon_type: St.IconType.SYMBOLIC, y_align: Clutter.ActorAlign.CENTER });
+        button.add_actor(this.overflowIcon);
+        this._overflowTooltip = new Tooltips.PanelItemTooltip({ actor: button }, _("Hidden icons"), this.orientation);
+        button.connect("button-press-event", (a, event) => this._onOverflowPress(event));
+        button.connect("button-release-event", (a, event) => {
+            if (global.settings.get_boolean("panel-edit-mode") || event.get_button() !== Clutter.BUTTON_PRIMARY)
+                return EVENT_PROPAGATE;
+            return EVENT_STOP;
+        });
+        this.overflowButton = button;
+        this.manager_container.insert_child_at_index(button, 0);
+        this._updateOverflowIcon();
+    }
+
+    /* The arrow points to where the menu opens */
+    _updateOverflowIcon() {
+        if (!this.overflowIcon)
+            return;
+        let name;
+        switch (this.orientation) {
+            case St.Side.TOP:
+                name = "pan-down-symbolic";
+                break;
+            case St.Side.LEFT:
+                name = "pan-end-symbolic";
+                break;
+            case St.Side.RIGHT:
+                name = "pan-start-symbolic";
+                break;
+            default:
+                name = "pan-up-symbolic";
+        }
+        this.overflowIcon.icon_name = name;
+        this.overflowIcon.icon_size = this.getPanelIconSize(St.IconType.SYMBOLIC);
+    }
+
+    /* The button is shown while at least one icon is hidden */
+    updateOverflowButton() {
+        if (!this.overflowButton)
+            return;
+        let any = false;
+        if (this.autohideEnabled) {
+            for (let e of this.entries.values()) {
+                if (e.autoHidden && !e.destroyed) {
+                    any = true;
+                    break;
+                }
+            }
+        }
+        this.overflowButton.visible = any;
+    }
+
+    /* Left click toggles the menu; right click falls through to the applet's own context menu */
+    _onOverflowPress(event) {
+        if (this._overflowTooltip)
+            this._overflowTooltip.hide();
+        if (global.settings.get_boolean("panel-edit-mode") || event.get_button() !== Clutter.BUTTON_PRIMARY)
+            return EVENT_PROPAGATE;
+        if (this.consumeClickIfMenuOpen(event))
+            return EVENT_STOP;
+        this.openOverflow();
+        return EVENT_STOP;
+    }
+
+    _newOverflowMenu() {
+        this._destroyOverflowMenu();
+        let menu = new Applet.AppletPopupMenu(this, this.orientation);
+        menu.sourceActor = this.overflowButton;
+        /*
+         * A manager of its own: in a shared one, moving the pointer from this menu back over the applet
+         * (the source of the icon menu) makes the manager switch to the icon menu, which is empty then.
+         */
+        if (!this.overflowMenuManager)
+            this.overflowMenuManager = new PopupMenu.PopupMenuManager(this);
+        this.overflowMenuManager.addMenu(menu);
+        menu.connect("open-state-changed", (m, open) => {
+            highlightSource(m, open);
+            if (m === this.overflowMenu && !open)
+                this._onOverflowClosed();
+        });
+        this.overflowMenu = menu;
+    }
+
+    _destroyOverflowMenu() {
+        let old = this.overflowMenu;
+        if (!old)
+            return;
+        try {
+            old.close(false);   // hands the icons back to the panel first
+        } catch (e) { /* ignore */ }
+        this._finishOverflowClose();
+        this.overflowMenu = null;
+        try {
+            this.overflowMenuManager.removeMenu(old);
+            old.destroy();
+        } catch (e) {
+            warn("could not dispose the hidden icons menu", e);
+        }
+    }
+
+    /*
+     * The real icons move into the menu while it is open (so they keep updating), in the panel order.
+     * There they are pictures only: the menu item takes the click, the menu closes, the icon goes back to
+     * the panel (it was used) and the click is repeated on it there.
+     */
+    openOverflow() {
+        let hidden = this.manager_container.get_children()
+            .map(a => a._delegate)
+            .filter(e => e instanceof TrayEntry && e.autoHidden && !e.destroyed);
+        if (hidden.length === 0)
+            return;
+        if (this.menu.isOpen)
+            this.menu.close(false);
+        this._newOverflowMenu();
+        this._overflowPending = null;
+        this._overflowMoved = [];
+        for (let entry of hidden) {
+            try {
+                this.overflowMenu.addMenuItem(this._makeOverflowItem(entry));
+            } catch (e) {
+                warn("could not add " + entry.displayName() + " to the hidden icons menu", e);
+            }
+        }
+        this.overflowMenu.open(true);
+    }
+
+    _makeOverflowItem(entry) {
+        let item = new PopupMenu.PopupBaseMenuItem();
+        /* A plain box, not an St.Bin: St.Bin tracks its child privately and asserts (crashing Cinnamon)
+         * when it is destroyed after the child was taken out with remove_child() */
+        let holder = new St.BoxLayout({ y_align: Clutter.ActorAlign.CENTER });
+        this._moveIntoOverflow(entry, holder);
+        item.addActor(holder, { expand: false });
+
+        let label = new St.Label({ text: entry.displayName(), y_align: Clutter.ActorAlign.CENTER });
+        item.addActor(label, { expand: true });
+
+        /* Small buttons at the end of the row; each closes the menu and acts once the icon is back */
+        let addButton = (iconNames, tip, pending) => {
+            let button = new St.Button({
+                reactive: true,
+                can_focus: false,
+                style_class: "unified-tray-pin",
+                child: new St.Icon({
+                    gicon: Gio.ThemedIcon.new_from_names(iconNames),
+                    icon_type: St.IconType.SYMBOLIC,
+                    icon_size: MENU_ICON_SIZE
+                })
+            });
+            let tooltip = new MenuButtonTooltip(button, tip, this.orientation);
+            button.connect("destroy", () => {
+                try {
+                    tooltip.destroy();
+                } catch (e) { /* already gone */ }
+            });
+            button.connect("clicked", () => {
+                if (this._overflowPending)
+                    return;
+                this._overflowPending = Object.assign({ entry: entry, button: 0 }, pending);
+                if (this.overflowMenu)
+                    this.overflowMenu.close(true);
+            });
+            item.addActor(button, { expand: false, align: St.Align.END });
+        };
+        /* Using an icon here only shows it for a while, so moving it back for good needs a button of its own */
+        let hours = Number(this.autohideHours) > 0 ? Number(this.autohideHours) : 24;
+        addButton(["view-reveal-symbolic", "go-up-symbolic"],
+            _("Move to the panel") + "\n" + (hours === 1 ? _("Hides again after 1 hour without use") :
+                _("Hides again after %d hours without use").replace("%d", String(hours))),
+            { restore: true });
+        addButton(["view-pin-symbolic", "emblem-favorite-symbolic"], _("Pin to the panel"), { pin: true });
+
+        /* Connected before the menu's own handler (addMenuItem), so this runs before the menu closes */
+        item.connect("activate", (it, event) => {
+            if (this._overflowPending)
+                return;
+            let button = Clutter.BUTTON_PRIMARY;
+            try {
+                let t = event ? event.type() : null;
+                if (t === Clutter.EventType.BUTTON_PRESS || t === Clutter.EventType.BUTTON_RELEASE)
+                    button = event.get_button();
+            } catch (e) { /* keyboard: primary */ }
+            this._overflowPending = { entry: entry, button: button };
+        });
+        return item;
+    }
+
+    _moveIntoOverflow(entry, holder) {
+        let actor = entry.actor;
+        entry._overflowSaved = {
+            reactive: actor.reactive,
+            trackHover: actor.track_hover,
+            iconReactive: entry.trayIcon ? entry.trayIcon.reactive : null
+        };
+        if (entry._tooltip)
+            entry._tooltip.hide();
+        actor.remove_style_pseudo_class("hover");
+        actor.reactive = false;
+        actor.track_hover = false;
+        if (entry.trayIcon)
+            entry.trayIcon.reactive = false;
+        this.manager_container.remove_child(actor);
+        holder.add_child(actor);
+        entry.inOverflow = true;
+        this._overflowMoved.push(entry);
+        entry.updateVisibility();
+    }
+
+    /*
+     * The menu still animates out after "closed" is signalled; the icons stay in it until it is hidden,
+     * otherwise it shrinks while fading. _finishOverflowClose() can also be called early (the menu is
+     * rebuilt or destroyed, an icon in it goes away) and then runs right away, once.
+     */
+    _onOverflowClosed() {
+        this._overflowClosedAt = Clutter.get_current_event_time();
+        this._finishOverflowClose();   // a close still waiting for its animation
+        let actor = this.overflowMenu ? this.overflowMenu.actor : null;
+        if (!actor || !actor.visible) {
+            this._overflowCloseWait = { cancel: () => {} };
+            this._finishOverflowClose();
+            return;
+        }
+        let signalId = 0;
+        let timer = 0;
+        let cancel = () => {
+            if (signalId) {
+                actor.disconnect(signalId);
+                signalId = 0;
+            }
+            if (timer) {
+                Mainloop.source_remove(timer);
+                timer = 0;
+            }
+        };
+        this._overflowCloseWait = { cancel: cancel };
+        signalId = actor.connect("notify::visible", () => {
+            if (!actor.visible)
+                this._finishOverflowClose();
+        });
+        timer = Mainloop.timeout_add(600, () => {   // in case the menu is never hidden
+            timer = 0;
+            this._finishOverflowClose();
+            return false;
+        });
+    }
+
+    _finishOverflowClose() {
+        let wait = this._overflowCloseWait;
+        if (!wait)
+            return;
+        this._overflowCloseWait = null;
+        wait.cancel();
+        let moved = this._overflowMoved || [];
+        this._overflowMoved = [];
+        for (let entry of moved) {
+            entry.inOverflow = false;
+            if (entry.destroyed)
+                continue;
+            try {
+                let actor = entry.actor;
+                let holder = actor.get_parent();
+                if (holder)
+                    holder.remove_child(actor);
+                this.manager_container.add_child(actor);
+                let saved = entry._overflowSaved || {};
+                actor.reactive = saved.reactive !== false;
+                actor.track_hover = saved.trackHover !== false;
+                if (entry.trayIcon && typeof saved.iconReactive === "boolean")
+                    entry.trayIcon.reactive = saved.iconReactive;
+                entry.updateVisibility();
+            } catch (e) {
+                warn("could not give " + entry.displayName() + " back to the panel", e);
+            }
+        }
+        this.sortEntries();
+
+        let pending = this._overflowPending;
+        this._overflowPending = null;
+        if (!pending || pending.entry.destroyed)
+            return;
+        let entry = pending.entry;
+        if (pending.pin)
+            this.setPinned(entry, true);
+        else if (pending.restore)
+            this.moveToPanel(entry);
+        else if (Number(this.autohideVisitMinutes) > 0)
+            this._showForAWhile(entry);
+        else
+            this._startTempVisit(entry);   // 0 minutes: only while it is in use
+        if (pending.button) {
+            /* Wait until the icon has its place in the panel and the menu's grab is gone */
+            Mainloop.timeout_add(150, () => {
+                if (!entry.destroyed && entry.actor.visible && entry.actor.get_parent() === this.manager_container)
+                    entry.replayClick(pending.button);
+                return false;
+            });
+        }
+    }
+
+    /*
+     * In the applet's context menu (right click the hidden icons button, or Ctrl+right click any icon):
+     *   "Hide <app> now",
+     *   "Pin <app> to the panel"  - only after a Ctrl+right click on an icon in the panel
+     *                               (the first one reads "Keep <app> in the panel" for an icon only visiting)
+     *   "Move to hidden icons"    - hide any icon in the panel right away
+     *   "Pin to the panel"        - pin icons so they are never hidden
+     */
+    _createKeepMenu() {
+        let ctx = this._applet_context_menu;
+        if (!ctx)
+            return;
+        this._hideNowItem = new PopupMenu.PopupIconMenuItem("", "view-conceal-symbolic", St.IconType.SYMBOLIC);
+        this._hideNowItem.connect("activate", () => {
+            let entry = this._hideNowEntry;
+            if (!entry)
+                return;
+            if (this.isVisiting(entry))
+                this.moveToPanel(entry);
+            else
+                this.hideNow(entry);
+        });
+        ctx.addMenuItem(this._hideNowItem);
+        this._pinNowItem = new PopupMenu.PopupSwitchMenuItem("", false);
+        this._pinNowItem.connect("toggled", (it, state) => {
+            if (this._hideNowEntry)
+                this.setPinned(this._hideNowEntry, state);
+        });
+        ctx.addMenuItem(this._pinNowItem);
+        this._hideItem = new PopupMenu.PopupSubMenuMenuItem(_("Move to hidden icons"));
+        ctx.addMenuItem(this._hideItem);
+        this._keepItem = new PopupMenu.PopupSubMenuMenuItem(_("Pin to the panel"));
+        ctx.addMenuItem(this._keepItem);
+        this._keepSeparator = new PopupMenu.PopupSeparatorMenuItem();
+        ctx.addMenuItem(this._keepSeparator);
+        ctx.connect("open-state-changed", (m, open) => {
+            if (open)
+                this._fillKeepMenu();
+            else
+                this._contextEntry = null;
+        });
+        this._fillKeepMenu();
+    }
+
+    _fillKeepMenu() {
+        if (!this._keepItem)
+            return;
+        let show = !!this.autohideEnabled;
+        let list = show ? Array.from(this.entries.values())
+            .filter(e => !e.destroyed && e.computeVisible() && !this.isUserHidden(e)) : [];
+        list.sort((a, b) => GLib.utf8_collate(a.displayName(), b.displayName()));
+
+        /* "Hide <app> now", for the icon this menu was opened from (Ctrl+right click within the last seconds) */
+        let ctxEntry = null;
+        let c = this._contextEntry;
+        if (show && c && GLib.get_monotonic_time() - c.at < 3e6 && list.indexOf(c.entry) >= 0 && !c.entry.autoHidden)
+            ctxEntry = c.entry;
+        this._hideNowEntry = ctxEntry;
+        this._hideNowItem.actor.visible = !!ctxEntry;
+        this._pinNowItem.actor.visible = !!ctxEntry;
+        if (ctxEntry) {
+            let name = ctxEntry.displayName();
+            this._hideNowItem.label.set_text((this.isVisiting(ctxEntry) ? _("Keep %s in the panel") : _("Hide %s now"))
+                .replace("%s", name));
+            this._pinNowItem.label.set_text(_("Pin %s to the panel").replace("%s", name));
+            this._pinNowItem.setToggleState(!!this._autohideRecord(ctxEntry).pin);
+        }
+
+        /* "Move to hidden icons": the icons that are in the panel now */
+        this._hideItem.menu.removeAll();
+        let inPanel = list.filter(e => !e.autoHidden);
+        this._hideItem.actor.visible = show && inPanel.length > 0;
+        for (let entry of inPanel) {
+            let item = new PopupMenu.PopupMenuItem(entry.displayName());
+            item.connect("activate", () => this.hideNow(entry));
+            this._hideItem.menu.addMenuItem(item);
+        }
+
+        this._keepItem.actor.visible = show;
+        this._keepSeparator.actor.visible = show;
+        this._keepItem.menu.removeAll();
+        if (!show)
+            return;
+        for (let entry of list) {
+            let rec = this._autohideRecord(entry);
+            let item = new PopupMenu.PopupSwitchMenuItem(entry.displayName(), !!rec.pin);
+            item.connect("toggled", (it, state) => this.setPinned(entry, state));
+            this._keepItem.menu.addMenuItem(item);
+        }
+        if (list.length === 0) {
+            let item = new PopupMenu.PopupMenuItem(_("No icons"));
+            item.setSensitive(false);
+            this._keepItem.menu.addMenuItem(item);
+        }
+    }
+
     /* ---- entry bookkeeping ---- */
     _registerEntry(entry) {
         this.entries.set(entry.key, entry);
@@ -3204,6 +4258,11 @@ class UnifiedTrayApplet extends Applet.Applet {
             return;
         if (this.menuEntry === entry)
             this.menu.close(false);
+        if (entry.inOverflow && this.overflowMenu) {
+            this.overflowMenu.close(false);   // gives the icon back to the panel before it is destroyed
+            this._finishOverflowClose();
+        }
+        this._endTempVisit(entry, true);
         this.entries.delete(key);
         entry.destroy();
         this.sortEntries();
@@ -3410,6 +4469,10 @@ class UnifiedTrayApplet extends Applet.Applet {
             this.signalManager.disconnectAllSignals();
         if (this.menu)
             this.menu.close(false);
+        this._shuttingDown = true;
+        this._syncAutohideTimer();
+        this._saveAutohide();
+        this._destroyOverflowMenu();
         for (let key of Array.from(this.entries.keys()))
             this.removeEntry(key);
         if (this.watcherId) {
