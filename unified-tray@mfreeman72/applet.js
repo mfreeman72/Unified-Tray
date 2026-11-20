@@ -3850,7 +3850,7 @@ class UnifiedTrayApplet extends Applet.Applet {
             x_expand: true,
             y_expand: true
         });
-        this.overflowIcon = new St.Icon({ icon_type: St.IconType.SYMBOLIC, y_align: Clutter.ActorAlign.CENTER });
+        this.overflowIcon = new St.Icon({ icon_type: St.IconType.SYMBOLIC, x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER });
         button.add_actor(this.overflowIcon);
         this._overflowTooltip = new Tooltips.PanelItemTooltip({ actor: button }, _("Hidden icons"), this.orientation);
         button.connect("button-press-event", (a, event) => this._onOverflowPress(event));
@@ -3884,6 +3884,17 @@ class UnifiedTrayApplet extends Applet.Applet {
         }
         this.overflowIcon.icon_name = name;
         this.overflowIcon.icon_size = this.getPanelIconSize(St.IconType.SYMBOLIC);
+
+        /* Like the tray icons (setOrientation), the button takes the theme's vertical applet-box style on
+         * side panels; otherwise its horizontal padding makes it wider than the panel, which widens the
+         * whole column and pushes every icon off-centre. */
+        if (isVertical(this.orientation)) {
+            this.overflowButton.vertical = true;
+            this.overflowButton.add_style_class_name("vertical");
+        } else {
+            this.overflowButton.vertical = false;
+            this.overflowButton.remove_style_class_name("vertical");
+        }
     }
 
     /* The button is shown while at least one icon is hidden */
